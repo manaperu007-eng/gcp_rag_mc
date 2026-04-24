@@ -1,0 +1,173 @@
+## ==============================================================================
+## backend/cloudbuild.yaml
+## Cloud Build CI/CD pipeline — builds, pushes, and deploys both services
+## Trigger: push to main branch
+## Substitutions (set in Cloud Build trigger):
+##   _PROJECT_ID, _REGION, _ENV, _BQ_DATASET, _DOCUMENT_BUCKET, etc.
+## ==============================================================================
+
+substitutions:
+  _REGION: us-central1
+  _ENV: dev
+  _API_SERVICE: kb-api
+  _INGESTION_SERVICE: kb-ingestion
+  _NOTIFICATIONS_SERVICE: kb-notifications
+  _REPO: kb-platform          # Artifact Registry repository name
+  _BQ_DATASET: kb_platform_dev
+
+steps:
+  # ── 1. Run linter ────────────────────────────────────────────────────────
+  - id: lint
+    name: python:3.12-slim
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        pip install -q ruff
+        ruff check backend/shared backend/api backend/ingestion
+
+  # ── 2. Build API image ───────────────────────────────────────────────────
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    dir: backend
+    args:
+      - build
+      - -f api/Dockerfile
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_API_SERVICE}:$SHORT_SHA
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_API_SERVICE}:latest
+      - .
+    waitFor: [lint]
+
+  # ── 3. Build Ingestion image ─────────────────────────────────────────────
+  - id: build-ingestion
+    name: gcr.io/cloud-builders/docker
+    dir: backend
+    args:
+      - build
+      - -f ingestion/Dockerfile
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_INGESTION_SERVICE}:$SHORT_SHA
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_INGESTION_SERVICE}:latest
+      - .
+    waitFor: [lint]
+
+  # ── 4. Push API image ────────────────────────────────────────────────────
+  - id: push-api
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_API_SERVICE}
+    waitFor: [build-api]
+
+  # ── 5. Push Ingestion image ──────────────────────────────────────────────
+  - id: push-ingestion
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_INGESTION_SERVICE}
+    waitFor: [build-ingestion]
+
+  # ── 6. Apply BigQuery schema ─────────────────────────────────────────────
+  - id: bq-schema
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        sed -e "s/\$${PROJECT_ID}/$$PROJECT_ID/g" \
+            -e "s/\$${DATASET}/${_BQ_DATASET}/g" \
+            backend/bigquery/schema.sql | \
+        bq query --use_legacy_sql=false --project_id=$$PROJECT_ID
+    waitFor: ['-']   # Run in parallel with image builds
+
+  # ── 7. Deploy API to Cloud Run ───────────────────────────────────────────
+  - id: deploy-api
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_API_SERVICE}-${_ENV}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_API_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=kb-api-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --min-instances=1
+      - --max-instances=20
+      - --memory=1Gi
+      - --cpu=1
+      - --set-env-vars=ENVIRONMENT=${_ENV},PROJECT_ID=$PROJECT_ID
+    waitFor: [push-api]
+
+  # ── 8. Deploy Ingestion to Cloud Run ────────────────────────────────────
+  - id: deploy-ingestion
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_INGESTION_SERVICE}-${_ENV}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_INGESTION_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=kb-ingestion-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --min-instances=0
+      - --max-instances=5
+      - --memory=2Gi
+      - --cpu=2
+      - --concurrency=1
+      - --set-env-vars=ENVIRONMENT=${_ENV},PROJECT_ID=$PROJECT_ID
+    waitFor: [push-ingestion]
+
+  # ── 9. Build Notifications image ─────────────────────────────────────────
+  - id: build-notifications
+    name: gcr.io/cloud-builders/docker
+    dir: backend
+    args:
+      - build
+      - -f notifications/Dockerfile
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_NOTIFICATIONS_SERVICE}:$SHORT_SHA
+      - -t ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_NOTIFICATIONS_SERVICE}:latest
+      - .
+    waitFor: [lint]
+
+  # ── 10. Push Notifications image ─────────────────────────────────────────
+  - id: push-notifications
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_NOTIFICATIONS_SERVICE}
+    waitFor: [build-notifications]
+
+  # ── 11. Deploy Notifications to Cloud Run ────────────────────────────────
+  - id: deploy-notifications
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - ${_NOTIFICATIONS_SERVICE}-${_ENV}
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_NOTIFICATIONS_SERVICE}:$SHORT_SHA
+      - --region=${_REGION}
+      - --platform=managed
+      - --no-allow-unauthenticated
+      - --service-account=kb-notifications-sa@$PROJECT_ID.iam.gserviceaccount.com
+      - --min-instances=0
+      - --max-instances=3
+      - --memory=256Mi
+      - --cpu=1
+      - --set-env-vars=ENVIRONMENT=${_ENV},PROJECT_ID=$PROJECT_ID
+    waitFor: [push-notifications]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_API_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_INGESTION_SERVICE}:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/${_NOTIFICATIONS_SERVICE}:$SHORT_SHA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8

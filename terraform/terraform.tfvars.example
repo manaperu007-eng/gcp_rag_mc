@@ -1,0 +1,38 @@
+##############################################################################
+# terraform.tfvars.example - Example variable values
+# Copy to terraform.tfvars and fill in your values
+##############################################################################
+
+project_id   = "your-gcp-project-id"
+region       = "us-central1"
+environment  = "dev"
+
+notification_email = "your-admin@yourdomain.com"
+
+gemini_model    = "gemini-1.5-pro-002"
+embedding_model = "text-embedding-004"
+
+questionnaire_admin_users = [
+  "admin1@yourdomain.com",
+  "admin2@yourdomain.com",
+]
+
+allowed_origins = [
+  "https://your-frontend-domain.com",
+]
+
+cloud_run_min_instances = 0
+cloud_run_max_instances = 10
+
+document_retention_days = 365
+bq_data_retention_days  = 0
+
+enable_data_catalog = false
+
+firestore_location = "nam5"   # Multi-region US
+
+labels = {
+  project    = "kb-questionnaire"
+  managed_by = "terraform"
+  owner      = "your-team"
+}
